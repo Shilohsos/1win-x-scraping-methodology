@@ -5,7 +5,7 @@ import asyncio
 import logging
 import signal
 import sys
-from typing import Optional
+from typing import Optional, Dict
 from src.utils.logger import setup_logging
 from src.utils.config import config
 from src.storage.db import Database
@@ -17,6 +17,19 @@ from src.collectors.odds import OddsCollector
 from src.alerts.telegram import TelegramAlerter
 from src.alerts.executor import BetExecutor
 
+from src.collectors.news import NewsCollector
+from src.collectors.reddit_scraper import RedditScraper
+from src.collectors.twitter_scraper import TwitterScraper
+from src.collectors.sofascore import SofascoreCollector
+from src.collectors.transfermarkt import TransfermarktCollector
+from src.collectors.official_sites import OfficialSitesCollector
+from src.collectors.physioroom import PhysioroomCollector
+from src.collectors.flashscore import FlashscoreCollector
+from src.collectors.oddschecker import OddscheckerCollector
+from src.models.signal_engine import SignalEngine
+from src.models.edge import EdgeCalculator
+import time
+from datetime import datetime, timezone
 setup_logging()
 logger = logging.getLogger("10xbet.main")
 
@@ -33,6 +46,30 @@ class TenXBetting:
         self.executor:   Optional[BetExecutor]       = None
         self.alerter:    Optional[TelegramAlerter]   = None
         self.running:    bool                        = False
+
+        # Multi-source scrapers (initialized in init_scrapers)
+        self._news_collector:      Optional[NewsCollector]      = None
+        self._reddit_scraper:      Optional[RedditScraper]      = None
+        self._twitter_scraper:     Optional[TwitterScraper]     = None
+        self._sofascore:           Optional[SofascoreCollector] = None
+        self._transfermarkt:       Optional[TransfermarktCollector] = None
+        self._official_sites:      Optional[OfficialSitesCollector] = None
+        self._physioroom:          Optional[PhysioroomCollector]   = None
+        self._flashscore:          Optional[FlashscoreCollector]   = None
+        self._oddschecker:         Optional[OddscheckerCollector]  = None
+        self._signal_engine:       Optional[SignalEngine]         = None
+        self._edge_calc_new:       Optional[EdgeCalculator]       = None
+        # Scheduler state
+        self._last_sentiment_scrape: float = 0
+        self._last_form_scrape:      float = 0
+        self._last_deep_scrape:      float = 0
+        self._last_daily_scrape:     float = 0
+        # In-memory caches for scraped data (keyed by team name or tuple)
+        self._team_form_cache:   Dict = {}
+        self._injuries_cache:    Dict = {}
+        self._h2h_cache:         Dict = {}
+        self._sentiment_cache:   Dict = {}
+        self._player_form_cache: Dict = {}
 
     async def initialize(self):
         logger.info("═══════════════════════════════════")
@@ -76,6 +113,95 @@ class TenXBetting:
         logger.info("✓ Telegram bot ready")
         logger.info("═══════════════════════════════════")
         logger.info("   ALL SYSTEMS GO — POLLING LIVE   ")
+
+        # Initialise multi-source scrapers and signal engine
+        await self.init_scrapers()
+
+    async def init_scrapers(self):
+        """Initialise all scraper instances once at startup."""
+        logger.info("Initialising scraper instances...")
+        self._news_collector     = NewsCollector()
+        self._reddit_scraper     = RedditScraper()
+        self._twitter_scraper    = TwitterScraper()
+        self._sofascore          = SofascoreCollector()
+        self._transfermarkt      = TransfermarktCollector()
+        self._official_sites     = OfficialSitesCollector()
+        self._physioroom         = PhysioroomCollector()
+        self._flashscore         = FlashscoreCollector()
+        self._oddschecker        = OddscheckerCollector()
+        self._signal_engine      = SignalEngine()
+        # Reuse existing self.edge_calc (new EdgeCalculator class already loaded)
+        # but we need the new interface; ensure we are using the updated EdgeCalculator.
+        self._edge_calc_new      = self.edge_calc
+        logger.info("All scrapers initialised")
+
+    @staticmethod
+    def should_run(last_run: float, interval: int) -> bool:
+        return (time.time() - last_run) >= interval
+
+    async def run_sentiment_scrape(self, fixtures):
+        """Run every 30 min — news, reddit, twitter sentiment."""
+        logger.info("Running sentiment scrape (%d fixtures)...", len(fixtures))
+        for fixture in fixtures[:10]:  # limit to avoid rate limiting
+            home = fixture.home_team
+            away = fixture.away_team
+            key = (home, away)
+            try:
+                news_res  = self._news_collector.get_sentiment(home, away)
+                reddit_res= self._reddit_scraper.get_sentiment(home, away)
+                twitter_res = self._twitter_scraper.get_sentiment(home, away)
+                self._sentiment_cache[key] = {
+                    "news":   {"score": news_res.get("score",0),   "count": news_res.get("count",0)},
+                    "reddit": {"score": reddit_res.get("score",0), "count": reddit_res.get("count",0)},
+                    "twitter":{"score": twitter_res.get("score",0),"count": twitter_res.get("count",0)},
+                }
+            except Exception as e:
+                logger.warning("Sentiment scrape error %s vs %s: %s", home, away, e)
+        self._last_sentiment_scrape = time.time()
+        logger.info("Sentiment scrape complete")
+
+    async def run_form_scrape(self, fixtures):
+        """Run every 3 hours — player form, injuries, official sites."""
+        logger.info("Running form scrape...")
+        teams_done = set()
+        for fixture in fixtures:
+            for team in [fixture.home_team, fixture.away_team]:
+                if team in teams_done:
+                    continue
+                teams_done.add(team)
+                try:
+                    # Sofascore team form
+                    form = self._sofascore.get_team_form(team)
+                    if form:
+                        self._team_form_cache[team] = form
+                    # Injuries
+                    injuries_physio = self._physioroom.get_injuries(team)
+                    injuries_tm = self._transfermarkt.get_team_injuries(team)
+                    # Combine
+                    all_inj = (injuries_physio or []) + (injuries_tm or [])
+                    self._injuries_cache[team] = all_inj
+                    # Official sites headlines (not used in evaluation currently)
+                    headlines = self._official_sites.get_team_news(team)
+                    # Could store if needed; skipping for now
+                except Exception as e:
+                    logger.warning("Form scrape error %s: %s", team, e)
+        self._last_form_scrape = time.time()
+        logger.info("Form scrape complete — %d teams", len(teams_done))
+
+    async def run_deep_scrape(self, fixtures):
+        """Run every 6 hours — H2H, oddschecker."""
+        logger.info("Running deep scrape...")
+        for fixture in fixtures:
+            try:
+                home, away = fixture.home_team, fixture.away_team
+                h2h = self._flashscore.get_h2h(home, away)
+                self._h2h_cache[(home, away)] = h2h
+                # Oddschecker sentiment not currently used in signal engine
+                # self._oddschecker.get_market_sentiment(home, away)
+            except Exception as e:
+                logger.warning("Deep scrape error: %s", e)
+        self._last_deep_scrape = time.time()
+        logger.info("Deep scrape complete")
         logger.info("═══════════════════════════════════")
 
     async def run_cycle(self):
@@ -88,6 +214,15 @@ class TenXBetting:
             if not matches:
                 logger.warning("No upcoming matches found")
                 return
+
+            # Multi-frequency scheduler: run scrapers if interval elapsed
+            if self.should_run(self._last_sentiment_scrape, 1800):
+                await self.run_sentiment_scrape(matches)
+            if self.should_run(self._last_form_scrape, 10800):
+                await self.run_form_scrape(matches)
+            if self.should_run(self._last_deep_scrape, 21600):
+                await self.run_deep_scrape(matches)
+            edges_found = 0
             edges_found = 0
             for match in matches[:25]:  # Cap per cycle
                 try:
@@ -105,32 +240,63 @@ class TenXBetting:
                     ref_stats = await self.referee_db.get_stats(
                         match.referee_id or ""
                     )
-                    # Calculate edge
-                    opportunities = self.edge_calc.calculate(
-                        match, odds, weather, ref_stats
+                    # --- NEW: Gather scraped data from caches ---
+                    home = match.home_team
+                    away = match.away_team
+                    team_form = {
+                        "home": self._team_form_cache.get(home, {}),
+                        "away": self._team_form_cache.get(away, {}),
+                    }
+                    injuries = {
+                        "home": self._injuries_cache.get(home, []),
+                        "away": self._injuries_cache.get(away, []),
+                    }
+                    h2h_data = self._h2h_cache.get((home, away), {})
+                    sentiment_data = self._sentiment_cache.get((home, away), {})
+                    player_form = {}   # Not yet scraped
+                    standings = None   # Not yet scraped
+                    # Evaluate all signal groups
+                    signal_eval = self._signal_engine.evaluate(
+                        fixture=match,
+                        odds=odds,
+                        weather=weather,
+                        referee=ref_stats,
+                        team_form=team_form,
+                        h2h=h2h_data,
+                        injuries=injuries,
+                        sentiment=sentiment_data,
+                        player_form=player_form,
+                        standings=standings,
                     )
-                    for market_key, opp_data in opportunities.items():
-                        opp_id = (
-                            f"opp_{match.id}_{market_key}_"
-                            f"{int(asyncio.get_event_loop().time())}"
-                        )
+                    # Calculate edge per market using new engine
+                    opportunities = self._edge_calc_new.calculate_all(
+                        odds_dict=odds,
+                        signal_eval=signal_eval,
+                        weather=weather,
+                        team_form=team_form,
+                        h2h=h2h_data,
+                    )
+                    for opp in opportunities:
+                        if not signal_eval.get("should_alert"):
+                            continue
+                        opp_id = f"opp_{match.id}_{opp['market_key']}_{int(asyncio.get_event_loop().time())}"
                         opportunity = {
-                            "id":    opp_id,
+                            "id": opp_id,
                             "match": match.to_dict(),
-                            **opp_data,
-                            "weather":       weather or {},
+                            **opp,
+                            "weather": weather or {},
                             "referee_stats": ref_stats,
+                            "edge_result": opp,
+                            "signal_eval": signal_eval,
                         }
-                        # Log to DB
                         await self.db.log_opportunity(opportunity)
-                        # Send Telegram alert
                         await self.alerter.send_alert(opportunity)
                         edges_found += 1
-                        # Rate limit alerts
                         await asyncio.sleep(1)
-                except Exception as e:
-                    logger.error(
-                        f"Match analysis error ({match.display_name()}): {e}"
+
+                except Exception:
+                    logger.exception(
+                        f"Match analysis error ({match.display_name()})"
                     )
                     continue
             logger.info(

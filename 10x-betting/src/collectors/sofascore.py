@@ -4,6 +4,48 @@ import logging
 logger = logging.getLogger("10xbet.sofascore")
 
 BASE = "https://api.sofascore.com/api/v1"
+
+
+# Static Sofascore team IDs — prevents API lookup failures
+TEAM_IDS = {
+    # EPL
+    "Arsenal":           42,
+    "Chelsea":           38,
+    "Manchester City":   17,
+    "Manchester United": 35,
+    "Liverpool":         44,
+    "Tottenham":         33,
+    "Newcastle":         39,
+    "Aston Villa":       40,
+    "West Ham":          37,
+    "Brighton":          211,
+    "Brentford":         7537,
+    "Fulham":            43,
+    "Crystal Palace":    7,
+    "Wolves":            3,
+    "Everton":           48,
+    "Nottm Forest":      14,
+    "Leicester":         31,
+    "Ipswich":           32,
+    "Southampton":       45,
+    "Leeds United":      46,
+    # La Liga
+    "Real Madrid":             2829,
+    "Barcelona":               2817,
+    "Atletico Madrid":         2836,
+    "Sevilla":                 2833,
+    "Valencia":                2828,
+    "Athletic Bilbao":         2818,
+    "Real Sociedad":           2824,
+    "Villarreal":              2826,
+    "Betis":                   2819,
+    "Osasuna":                 2823,
+    "Celta Vigo":              2821,
+    "Espanyol":                2820,
+    "Alaves":                  2816,
+    "Getafe":                  2859,
+    "Rayo Vallecano":          2862,
+}
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 12; Infinix X6816D) "
@@ -22,16 +64,27 @@ class SofascoreCollector:
 
     def get_team_form(self, team_name):
         try:
-            r = self.session.get(
-                f"{BASE}/search/all",
-                params={"q": team_name},
-                timeout=10,
-            )
-            data = r.json()
-            teams = data.get("teams", {}).get("hits", [])
-            if not teams:
-                return None
-            team_id = teams[0]["entity"]["id"]
+            # Try static map first
+            team_id = TEAM_IDS.get(team_name)
+            if not team_id:
+                # Fuzzy match
+                for k, v in TEAM_IDS.items():
+                    if k.lower() in team_name.lower():
+                        team_id = v
+                        break
+            if not team_id:
+                # Fall back to API search
+                r = self.session.get(
+                    f"{BASE}/search/all",
+                    params={"q": team_name},
+                    timeout=10,
+                )
+                data = r.json()
+                teams = data.get("teams", {}).get("hits", [])
+                if not teams:
+                    logger.warning("Sofascore: no team ID for %s", team_name)
+                    return None
+                team_id = teams[0]["entity"]["id"]
             r2 = self.session.get(
                 f"{BASE}/team/{team_id}/events/last/0",
                 timeout=10,

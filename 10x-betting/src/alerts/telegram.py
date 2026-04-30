@@ -98,72 +98,92 @@ class TelegramAlerter:
         logger.info(f"Telegram bot @{me.username} online")
 
 
+    def _format_signal_alert(self, fixture, market_key, odds,
+                             edge_result, signal_eval,
+                             market_instruction=""):
+        """Build the new multi-signal alert message."""
+        home = fixture.get("home_team") if isinstance(fixture, dict) else getattr(fixture, "home_team", "Unknown")
+        away = fixture.get("away_team") if isinstance(fixture, dict) else getattr(fixture, "away_team", "Unknown")
+        league = fixture.get("league") if isinstance(fixture, dict) else getattr(fixture, "competition", "Football")
+        kickoff = fixture.get("kickoff") if isinstance(fixture, dict) else getattr(fixture, "kickoff", None)
+        match_time = (datetime.fromisoformat(kickoff.replace("Z", "+00:00")).strftime("%d %b") if kickoff else "TBD")
+
+        confidence = "HIGH CONFIDENCE" if signal_eval.get("high_confidence") else "MEDIUM CONFIDENCE"
+        stake_level = signal_eval.get("stake_level", "LOW      ")
+        edge_pct = edge_result.get("edge_pct", 0)
+        implied = edge_result.get("implied_prob", 0) * 100
+        our_prob = edge_result.get("our_prob", 0) * 100
+
+        # Build signal lines
+        signal_lines = []
+        groups = signal_eval.get("groups", [])
+        for group in groups:
+            if group.name == "Availability":
+                icon = "⏺️ "
+            elif group.active:
+                icon = "🟢 "
+            else:
+                icon = "⚪️ "
+            signal_lines.append(f"{icon} {group.name} — {group.reason}")
+
+        signals_text = "\n".join(signal_lines)
+
+        nav = f"\nFIND ON 1WIN: {market_instruction}" if market_instruction else ""
+
+        msg = (
+            f"    EDGE DETECTED — {confidence}\n\n"
+            f"{home} vs {away}\n"
+            f"{league} | {match_time}\n\n"
+            f"Market: {market_key.replace('_', ' ').title()}\n"
+            f"Odds: {odds:.2f} (Implied: {implied:.1f}%)\n"
+            f"Our Prob: {our_prob:.1f}%\n"
+            f"Edge: +{edge_pct:.1f}%\n\n"
+            f"Signals:\n{signals_text}"
+            f"{nav}\n\n"
+            f"STAKE {stake_level}"
+        )
+        return msg
+
+
     async def send_alert(self, opportunity: Dict) -> Optional[str]:
         opp_id = opportunity["id"]
         match = opportunity["match"]
-        market = get_market(opportunity["market"])
-        market_name = market.name if market else opportunity["market"]
-        market_key = opportunity["market"]
-
-        odds = opportunity["bookmaker_odds"]
-        ip = opportunity["implied_probability"] * 100
-        hp = opportunity["hermes_probability"] * 100
-        edge = opportunity["edge_percentage"]
-        weather = opportunity.get("weather") or {}
-        ref = opportunity.get("referee_stats") or {}
-
-        rain = weather.get("rain", 0)
-        wind = weather.get("wind_speed", 0)
-        avg_cards = ref.get("avg_yellow_cards", 3.5)
-
+        market_key = opportunity.get("market_key") or opportunity.get("market")
+        # Extract engine outputs (passed from main.py)
+        edge_result  = opportunity.get("edge_result") or {}
+        signal_eval  = opportunity.get("signal_eval") or {}
+        # Core metrics
+        odds = edge_result.get("decimal_odds", 0)
+        edge = edge_result.get("edge_pct", 0)
+        # Stake recommendation (still based on edge magnitude)
         stake = _recommended_stake(edge)
+        # Navigation overlay (1win)
         league = match.get("league", "")
-        nav_path = LEAGUE_PATHS.get(league, "Football → search match")
-        tab_name = MARKET_TABS.get(market_key, market_name)
-
-        # Edge strength label
-        if edge >= 20:
-            strength = "        STRONG EDGE"
-        elif edge >= 15:
-            strength = "      GOOD EDGE"
-        else:
-            strength = "      EDGE"
-
-        text = (
-            f"{strength}\n\n"
-            f"*{_esc(match['home_team'])} vs {_esc(match['away_team'])}*\n"
-            f"    {_esc(nav_path)}\n"
-            f"    {_esc(match.get('kickoff', 'TBC')[:16].replace('T', ' '))}\n\n"
-            f"*Market:* {_esc(market_name)}\n"
-            f"*Odds:* {_esc(str(odds))} "
-            f"\\(Implied: {_esc(f'{ip:.1f}')}%\\)\n"
-            f"*Our Prob:* {_esc(f'{hp:.1f}')}%\n"
-            f"*Edge:* \\+{_esc(f'{edge:.1f}')}%\n\n"
-            f"*Why:*\n"
-            f"• Rain: {_esc(f'{rain:.1f}')}mm     "
-            f"Wind: {_esc(f'{wind:.1f}')}m/s\n"
-            f"• Referee avg cards: {_esc(str(avg_cards))}\n\n"
-            f"    *FIND ON 1WIN:*\n"
-            f"{_esc(nav_path)}\n"
-            f"Search: {_esc(match['home_team'])} vs "
-            f"{_esc(match['away_team'])}\n"
-            f"Tab: {_esc(tab_name)}\n\n"
-            f"    *Recommended stake: ₦{stake:,}*"
+        nav_path  = LEAGUE_PATHS.get(league, "Football → search match")
+        market   = get_market(market_key)
+        market_name = market.name if market else market_key.replace("_", " ").title()
+        tab_name  = MARKET_TABS.get(market_key, market_name)
+        market_instruction = (
+            f"\nFIND ON 1WIN:\n{nav_path}\n"
+            f"Search: {match['home_team']} vs {match['away_team']}\n"
+            f"Tab: {tab_name}"
         )
-
+        # Build alert text with multi-signal data
+        text = self._format_signal_alert(
+            fixture=match,
+            market_key=market_key,
+            odds=odds,
+            edge_result=edge_result,
+            signal_eval=signal_eval,
+            market_instruction=market_instruction,
+        )
+        # Button row
         keyboard = [
             [
-                InlineKeyboardButton(
-                    f"    PLACED ₦{stake:,}",
-                    callback_data=f"placed|{stake}|{opp_id}"
-                ),
-                InlineKeyboardButton(
-                    "    SKIP",
-                    callback_data=f"skip|0|{opp_id}"
-                ),
+                InlineKeyboardButton(f"    PLACED ₦{stake:,}", callback_data=f"placed|{stake}|{opp_id}"),
+                InlineKeyboardButton("    SKIP", callback_data=f"skip|0|{opp_id}"),
             ]
         ]
-
         try:
             msg = await self.app.bot.send_message(
                 chat_id=self.chat_id,
@@ -173,16 +193,17 @@ class TelegramAlerter:
             )
             self.pending[opp_id] = {
                 "opportunity": opportunity,
-                "message_id":   msg.message_id,
-                "timestamp":    datetime.utcnow().isoformat(),
-                "stake":        stake,
+                "message_id":  msg.message_id,
+                "timestamp":   datetime.utcnow().isoformat(),
+                "stake":       stake,
             }
             logger.info(f"Alert sent: {opp_id} | edge={edge:.1f}%")
             return opp_id
-
         except Exception as e:
             logger.error(f"Alert send failed: {e}")
             return None
+
+
 
 
     async def _on_button(

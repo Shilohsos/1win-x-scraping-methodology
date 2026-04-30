@@ -9,6 +9,10 @@ NITTER_INSTANCES = [
     "https://nitter.privacydev.net",
     "https://nitter.poast.org",
     "https://nitter.woodland.cafe",
+    "https://nitter.rawbit.ninja",
+    "https://nitter.mint.lgbt",
+    "https://nitter.esmailelbob.xyz",
+    "https://nitter.tiekoetter.com",
 ]
 
 HEADERS = {
