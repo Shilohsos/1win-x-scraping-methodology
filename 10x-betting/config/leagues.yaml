@@ -1,0 +1,15 @@
+leagues:
+  - code: PL
+      name: English Premier League
+      country: England
+      football_data_code: PL
+
+  - code: CL
+      name: UEFA Champions League
+      country: Europe
+      football_data_code: CL
+
+  - code: PD
+      name: Primera Division
+      country: Spain
+      football_data_code: PD
