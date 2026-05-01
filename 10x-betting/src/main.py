@@ -171,6 +171,8 @@ class TenXBetting:
                     form = self._flashscore.get_team_form(team)
                     if form:
                         self._team_form_cache[team] = form
+                    # Stagger requests to respect Football-Data.org rate limits (~8/min burst)
+                    time.sleep(0.7)
                     # Injuries
                     injuries_physio = self._physioroom.get_injuries(team)
                     injuries_tm = self._transfermarkt.get_team_injuries(team)
