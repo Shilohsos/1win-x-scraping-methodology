@@ -2,6 +2,8 @@ import logging
 import requests
 import time
 import re
+import json
+from pathlib import Path
 from typing import Optional, Dict
 
 logger = logging.getLogger("10xbet.flashscore")
@@ -18,6 +20,12 @@ if ENV_PATH.exists():
 API_KEY = os.getenv('FOOTBALL_DATA_API_KEY')
 BASE_URL = "https://api.football-data.org/v4"
 HEADERS = {"X-Auth-Token": API_KEY} if API_KEY else {}
+
+CACHE_PATH = Path("/root/10x-betting/.cache/fd_team_map.json")
+_LAST_API_CALL = 0
+
+# Competitions we cover: PL, CL, PD
+COMP_CODES = ["PL", "CL", "PD"]
 
 def _clean_name(name: str) -> str:
     n = name.lower()
@@ -40,42 +48,62 @@ def _refresh_team_map() -> bool:
         logger.error("Flashscore: FOOTBALL_DATA_API_KEY missing from .env")
         return False
     try:
-        r = requests.get(f"{BASE_URL}/competitions/PD/teams",
-                         headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            logger.error("Failed to fetch team list: HTTP %s", r.status_code)
-            return False
-        teams = r.json().get('teams', [])
         _TEAM_MAP.clear()
-        for t in teams:
-            tid = t['id']
-            name = t['name']
-            _TEAM_MAP[name.lower()] = tid
-            _TEAM_MAP[_clean_name(name)] = tid
-            if t.get('shortName'):
-                _TEAM_MAP[t['shortName'].lower()] = tid
+        for code in COMP_CODES:
+            r = requests.get(f"{BASE_URL}/competitions/{code}/teams",
+                             headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                logger.warning("Failed to fetch %s teams: HTTP %s", code, r.status_code)
+                continue
+            teams = r.json().get('teams', [])
+            for t in teams:
+                tid = t['id']
+                name = t['name']
+                _TEAM_MAP[name.lower()] = tid
+                _TEAM_MAP[_clean_name(name)] = tid
+                if t.get('shortName'):
+                    _TEAM_MAP[t['shortName'].lower()] = tid
+            logger.info("Loaded %d teams from %s", len(teams), code)
+        # Manual aliases for ambiguous/common names not guaranteed from API
         ALIASES = {
-            'barcelona': 81, 'barc': 81, 'barça': 81, 'fc barcelona': 81,
-            'real madrid': 86, 'madrid': 86, 'real madrid cf': 86,
-            'atletico': 78, 'atlético': 78, 'atleti': 78,
-            'valencia': 95, 'valencia cf': 95,
-            'girona': 298, 'girona fc': 298,
-            'sevilla': 559, 'sevilla fc': 559,
-            'athletic': 77, 'athletic bilbao': 77, 'athletic club': 77, 'bilbao': 77,
-            'real betis': 90, 'betis': 90,
-            'villarreal': 94, 'villarreal cf': 94,
-            'celta': 558, 'celta vigo': 558,
-            'rayo': 87, 'rayo vallecano': 87,
-            'mallorca': 89, 'rcd mallorca': 89,
-            'alaves': 263, 'alavés': 263,
-            'osasuna': 79,
-            'levante': 88,
-            'getafe': 82,
-            'espanyol': 80,
+            # PL
+            'manchester city': 57, 'man city': 57, 'mancity': 57,
+            'manchester united': 66, 'man united': 66, 'manutd': 66,
+            'liverpool': 64, 'lfc': 64,
+            'chelsea': 61, 'cfc': 61,
+            'arsenal': 56, 'afc': 56,
+            'tottenham': 73, 'spurs': 73,
+            'newcastle': 67, 'newcastle united': 67,
+            'brighton': 397, 'brighton & hove albion': 397,
+            'wolves': 76, 'wolverhampton': 76, 'wolverhampton wanderers': 76,
+            'west ham': 563, 'west ham united': 563,
+            'aston villa': 58, 'villa': 58,
+            'crystal palace': 354, 'palace': 354,
+            'leeds': 341, 'leeds united': 341,
+            'leicester': 62, 'leicester city': 62,
+            'everton': 62,  # note: might overlap; verify
+            'sunderland': 71,
+            'burnley': 328,
+            'brentford': 402,
+            'nottingham forest': 351, 'forest': 351,
+            'afc bournemouth': 1044, 'bournemouth': 1044,
+            # CL (top clubs)
+            'bayern': 5, 'bayern munich': 5,
+            'dortmund': 4, 'borussia dortmund': 4,
+            'psg': 524, 'paris saint-germain': 524,
+            'inter': 108, 'internazionale': 108,
+            'ac milan': 98, 'milan': 98,
+            'juventus': 109,
+            'bayer leverkusen': 2,
+            'atlético madrid': 78, 'atletico': 78, 'atleti': 78,
+            'porto': 122, 'fc porto': 122,
+            'benfica': 190,
+            # already mapped via API: barcelona, real madrid, valencia, sevilla, etc.
         }
         _TEAM_MAP.update(ALIASES)
         _LAST_REFRESH = time.time()
-        logger.info("Flashscore team map refreshed — %d teams", len(_TEAM_MAP))
+        logger.info("Flashscore team map ready — %d teams across %s",
+                    len(_TEAM_MAP), ','.join(COMP_CODES))
         return True
     except Exception as e:
         logger.error("Failed to refresh team map: %s", e)
@@ -99,6 +127,7 @@ class FlashscoreCollector:
         return _TEAM_MAP.get(cleaned)
 
     def get_team_form(self, team_name: str) -> Optional[dict]:
+        _ensure_team_map()
         team_id = self._get_team_id(team_name)
         if not team_id:
             logger.warning("Flashscore: unknown team '%s'", team_name)
@@ -141,7 +170,7 @@ class FlashscoreCollector:
                 ga_total += ga
             form_str = ''.join(outcomes)
             count = len(outcomes)
-            logger.info("Flashscore form %s: %s (avg GF:%g GA:%g)",
+            logger.info("Flashscore form %s: %s (GF:%g GA:%g)",
                         team_name, form_str, round(gf_total/count,2), round(ga_total/count,2))
             return {
                 "team_id": team_id,
