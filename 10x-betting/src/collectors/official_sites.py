@@ -59,10 +59,10 @@ ALL_CLUBS = {**EPL_CLUBS, **LALIGA_CLUBS}
 class OfficialSitesCollector:
     def __init__(self):
         self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.proxies = {"http": None, "https": None}
         self.session.headers.update(HEADERS)
-        logger.info(
-            "OfficialSitesCollector ready — %d clubs", len(ALL_CLUBS)
-        )
+        logger.info("OfficialSitesCollector ready — %d clubs", len(ALL_CLUBS))
 
     def get_team_news(self, team_name):
         url = ALL_CLUBS.get(team_name)

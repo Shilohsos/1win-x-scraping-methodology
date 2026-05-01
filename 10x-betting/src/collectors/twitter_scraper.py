@@ -1,60 +1,76 @@
-import requests
 import logging
-from bs4 import BeautifulSoup
-from textblob import TextBlob
+import sys
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+import re
 
 logger = logging.getLogger("10xbet.twitter")
 
-NITTER_INSTANCES = [
-    "https://nitter.privacydev.net",
-    "https://nitter.poast.org",
-    "https://nitter.woodland.cafe",
-    "https://nitter.rawbit.ninja",
-    "https://nitter.mint.lgbt",
-    "https://nitter.esmailelbob.xyz",
-    "https://nitter.tiekoetter.com",
-]
+# Load last30days .env (credentials and proxy)
+ENV_path = Path.home() / ".config" / "last30days" / ".env"
+if ENV_path.exists():
+    from dotenv import load_dotenv
+    load_dotenv(str(ENV_path))
+    logger.info("Loaded last30days .env (X credentials + proxy activated)")
+else:
+    logger.warning("last30days .env not found at %s", ENV_path)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 12; Infinix X6816D) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/112.0.0.0 Mobile Safari/537.36"
-    )
-}
+# Add last30days scripts to path
+SCRIPTS_DIR = Path.home() / ".hermes" / "skills" / "research" / "last30days" / "scripts"
+if SCRIPTS_DIR.exists():
+    sys.path.insert(0, str(SCRIPTS_DIR))
+else:
+    logger.error("last30days scripts dir missing: %s", SCRIPTS_DIR)
+
+import lib.bird_x as _bx
 
 class TwitterScraper:
     def __init__(self):
-        logger.info("TwitterScraper ready (Nitter proxy mode)")
+        self.auth_token = os.getenv("AUTH_TOKEN")
+        self.ct0 = os.getenv("CT0")
+        if self.auth_token and self.ct0:
+            _bx.AUTH_TOKEN = self.auth_token
+            _bx.CR_CSRF_TOKEN = self.ct0
+            logger.info("X credentials loaded for bird_x")
+        else:
+            logger.warning("Missing AUTH_TOKEN or CT0 — X scraping may fail")
+        logger.info("TwitterScraper ready (last30days/bird_x)")
 
-    def get_sentiment(self, team_home, team_away):
-        query = f"{team_home} {team_away}"
-        tweets = []
-        for instance in NITTER_INSTANCES:
-            try:
-                encoded = requests.utils.quote(query)
-                url = f"{instance}/search?q={encoded}&f=tweets"
-                r = requests.get(url, headers=HEADERS, timeout=10)
-                if r.status_code != 200:
-                    continue
-                soup = BeautifulSoup(r.text, "lxml")
-                tweet_divs = (
-                    soup.find_all("div", class_="tweet-content")
-                    or soup.find_all("div", class_="content")
-                )
-                for div in tweet_divs[:15]:
-                    text = div.get_text(strip=True)
-                    if text and len(text) > 10:
-                        score = TextBlob(text).sentiment.polarity
-                        tweets.append({"text": text[:200], "score": score})
-                if tweets:
-                    break
-            except Exception as e:
-                logger.warning("Nitter instance %s failed: %s", instance, e)
+    def get_sentiment(self, team_home: str, team_away: str) -> dict:
+        topic = f"{team_home} {team_away}"
+        now = datetime.now()
+        try:
+            result = _bx.search_x(
+                topic=topic,
+                from_date=(now - timedelta(days=30)).strftime("%Y-%m-%d"),
+                to_date=now.strftime("%Y-%m-%d"),
+                depth="default"
+            )
+            items = result.get("items") or []
+            count = len(items)
+            if count == 0:
+                return {"score": 0.0, "posts": [], "count": 0}
+        except Exception as e:
+            logger.error("bird_x.search_x failed: %s", e)
+            return {"score": 0.0, "posts": [], "count": 0, "error": str(e)}
+        score = 0.0
+        for item in items:
+            text = item.get("text", "")
+            sentiment = self._simple_sentiment(text)
+            if sentiment > 0.1:
+                score += 1
+            elif sentiment < -0.1:
+                score -= 1
+        if count:
+            score = score / count
+        return {"score": round(score, 3), "posts": items, "count": count}
 
-        avg = sum(t["score"] for t in tweets) / len(tweets) if tweets else 0
-        logger.info(
-            "Twitter sentiment %s vs %s: %.2f (%d tweets)",
-            team_home, team_away, avg, len(tweets)
-        )
-        return {"score": avg, "tweets": tweets, "count": len(tweets)}
+    def _simple_sentiment(self, text: str) -> float:
+        pos = len(re.findall(r'\b(beat|win|great|amazing|victory|happy|good)\b', text, re.I))
+        neg = len(re.findall(r'\b(lose|loss|terrible|awful|defeat|bad|worst)\b', text, re.I))
+        total = pos + neg
+        return (pos - neg) / total if total else 0.0
+
+_scraper = TwitterScraper()
+get_sentiment = _scraper.get_sentiment

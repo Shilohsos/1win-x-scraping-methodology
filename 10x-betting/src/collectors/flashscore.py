@@ -58,3 +58,22 @@ class FlashscoreCollector:
         except Exception as e:
             logger.warning("Flashscore H2H error: %s", e)
             return {"matches": [], "home_wins": 0, "away_wins": 0, "draws": 0}
+
+
+    def get_team_form(self, team_name: str) -> dict:
+        """
+        Return team-form structure for signal engine.
+        Note: Direct scraping blocked — returning empty valid structure.
+        """
+        logger.info("Flashscore: team form unavailable for %s (site blocks bots)", team_name)
+        return {
+            "team_id": None,
+            "form": "",
+            "last_5": [],
+            "goals_scored_avg": 0.0,
+            "goals_conceded_avg": 0.0,
+            "matches_analyzed": 0,
+        }
+
+_scraper = FlashscoreCollector()
+get_team_form = _scraper.get_team_form

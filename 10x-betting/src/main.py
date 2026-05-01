@@ -20,7 +20,6 @@ from src.alerts.executor import BetExecutor
 from src.collectors.news import NewsCollector
 from src.collectors.reddit_scraper import RedditScraper
 from src.collectors.twitter_scraper import TwitterScraper
-from src.collectors.sofascore import SofascoreCollector
 from src.collectors.transfermarkt import TransfermarktCollector
 from src.collectors.official_sites import OfficialSitesCollector
 from src.collectors.physioroom import PhysioroomCollector
@@ -51,7 +50,6 @@ class TenXBetting:
         self._news_collector:      Optional[NewsCollector]      = None
         self._reddit_scraper:      Optional[RedditScraper]      = None
         self._twitter_scraper:     Optional[TwitterScraper]     = None
-        self._sofascore:           Optional[SofascoreCollector] = None
         self._transfermarkt:       Optional[TransfermarktCollector] = None
         self._official_sites:      Optional[OfficialSitesCollector] = None
         self._physioroom:          Optional[PhysioroomCollector]   = None
@@ -123,7 +121,6 @@ class TenXBetting:
         self._news_collector     = NewsCollector()
         self._reddit_scraper     = RedditScraper()
         self._twitter_scraper    = TwitterScraper()
-        self._sofascore          = SofascoreCollector()
         self._transfermarkt      = TransfermarktCollector()
         self._official_sites     = OfficialSitesCollector()
         self._physioroom         = PhysioroomCollector()
@@ -171,7 +168,7 @@ class TenXBetting:
                 teams_done.add(team)
                 try:
                     # Sofascore team form
-                    form = self._sofascore.get_team_form(team)
+                    form = self._flashscore.get_team_form(team)
                     if form:
                         self._team_form_cache[team] = form
                     # Injuries
