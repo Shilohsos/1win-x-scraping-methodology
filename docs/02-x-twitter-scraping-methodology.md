@@ -203,45 +203,57 @@ headers = {
 }
 ```
 
-### Response Structure
+### Response Structure (as of May 2026)
 ```json
 {
   "data": {
     "search_by_raw_query": {
-      "timeline": {
-        "instructions": [
-          {
-            "type": "TimelineAddEntries",
-            "entries": [
-              {
-                "entryId": "tweet-123",
-                "content": {
-                  "item": {
-                    "tweet": { ... full tweet object ... }
+      "search_timeline": {          ← Note: extra level added
+        "timeline": {
+          "instructions": [
+            {
+              "type": "TimelineAddEntries",
+              "entries": [
+                {
+                  "entryId": "tweet-123",
+                  "content": {
+                    "itemContent": {           ← Was: "item"
+                      "tweet_results": {       ← Was: "tweet"
+                        "result": { ... full tweet object ... }
+                      }
+                    }
                   }
                 }
-              }
-            ]
-          }
-        ]
+              ]
+            }
+          ]
+        }
       }
     }
   }
 }
 ```
 
-### Extraction Algorithm
+> **Note:** X changes this structure periodically. The extraction path as of May 2026 is:
+> `data.search_by_raw_query.search_timeline.timeline.instructions[].entries[].content.itemContent.tweet_results.result`
+> 
+> Older patterns used: `data.search_by_raw_query.timeline.instructions[].entries[].content.item.tweet`
+
+### Extraction Algorithm (Updated May 2026)
 ```python
 def extract_tweets_from_response(resp_json):
     tweets = []
-    timeline = (resp_json.get('data', {})
-                .get('search_by_raw_query', {})
-                .get('timeline', {}))
+    # As of May 2026: extra "search_timeline" level and new item path
+    search_data = resp_json.get('data', {}).get('search_by_raw_query', {})
+    timeline = search_data.get('search_timeline', search_data.get('timeline', {}))
     for instruction in timeline.get('instructions', []):
         for entry in instruction.get('entries', []):
-            item = entry.get('content', {}).get('item', {})
-            tweet = item.get('tweet')
-            if tweet:
+            content = entry.get('content', {})
+            # Try new path first, fall back to old path
+            item = content.get('itemContent', content.get('item', {}))
+            tweet = (item.get('tweet_results', {}) if 'itemContent' in content 
+                     else item).get('result', item.get('tweet'))
+            if tweet and isinstance(tweet, dict) and tweet.get('__typename') == 'Tweet':
                 tweets.append(tweet)
     return tweets
 ```
