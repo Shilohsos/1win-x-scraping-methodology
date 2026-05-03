@@ -1,15 +1,17 @@
 """
 10x Betting — Injuries Collector
 Source: Sofascore player profile API (via proxied browser)
-Scope: Match-day squad only — checks only players in starting XI + subs
+Scope: Full squad — all players registered to each team in the season
 
 Flow:
-  1. Fetch today's EPL matches → Sofascore event IDs
-  2. For each match, fetch lineups → player IDs
-  3. For each player in squad, fetch profile → check `injury` field
-  4. Return list of injured players per team
+  1. Fetch full competition squad → {team_id: [player_id, ...]}
+     (1 API call, cached per season)
+  2. For each match, fetch player profiles for all squad members
+  3. Check `injury` field on each profile
+  4. Return injured players per team
 
-Performance: ~35-40s per match (persistent browser, cached profiles)
+Performance: ~45-60s per team for first scan (cached thereafter)
+             528 players total across 20 EPL teams
 
 Requires:
   - botasaurus_driver (from scraperfc_venv)
@@ -84,10 +86,42 @@ class SofascoreClient:
 
 
 class SofascoreInjuryScanner:
-    """Scans match-day squads for injured players via Sofascore."""
+    """Scans full squads for injured players via Sofascore player profiles.
+
+    Uses a single API call to get ALL players in the EPL season grouped by team,
+    then fetches each player's profile to check for injury data.
+    """
 
     def __init__(self):
         self.client = SofascoreClient()
+        self._squad_cache: Optional[Dict[int, List[int]]] = None  # team_id -> [player_id]
+        self._team_name_cache: Dict[int, str] = {}
+
+    # ── Full squad data (cached per season) ────────────────────────
+
+    def _load_squads(self):
+        """Fetch ALL EPL players in one call, group by team. Cached."""
+        if self._squad_cache is not None:
+            return
+        logger.info("Fetching full EPL squad roster (%d players expected)...", 528)
+        data = self.client.fetch(f"{API}/unique-tournament/{EPL_ID}/season/{SEASON_ID}/players")
+        teams: Dict[int, List[int]] = {}
+        for p in data.get("players", []):
+            tid = p.get("team", {}).get("id") or p.get("teamId")
+            pid = p.get("playerId") or p.get("id")
+            name = p.get("team", {}).get("name", "")
+            if tid and pid:
+                teams.setdefault(tid, []).append(pid)
+                if name and tid not in self._team_name_cache:
+                    self._team_name_cache[tid] = name
+        self._squad_cache = teams
+        logger.info("Loaded %d teams, %d total players", len(teams),
+                     sum(len(pids) for pids in teams.values()))
+
+    def get_team_roster(self, team_id: int) -> List[int]:
+        """Get all player IDs for a team."""
+        self._load_squads()
+        return self._squad_cache.get(team_id, [])
 
     # ── Match data ─────────────────────────────────────────────────
 
@@ -106,7 +140,7 @@ class SofascoreInjuryScanner:
                 seen.add(e["id"])
                 out.append(e)
 
-        # Scheduled events (last 0-4 pages cover today)
+        # Scheduled events
         for page in range(5):
             ev = self.client.fetch(f"{API}/unique-tournament/{EPL_ID}/season/{SEASON_ID}/events/last/{page}")
             for e in ev.get("events", []):
@@ -118,56 +152,67 @@ class SofascoreInjuryScanner:
         out.sort(key=lambda m: m.get("startTimestamp", 0))
         return out
 
-    def get_lineups(self, match_id: int) -> Tuple[List[int], List[int]]:
+    # ── Injury scan (full squad) ───────────────────────────────────
+
+    def scan_team(self, team_id: int, team_name: str = "") -> List[dict]:
+        """Scan ALL players registered to a team for injuries.
+
+        Returns list of injured players, each with:
+          {player, player_id, injury, status, return_date, position}
         """
-        Fetch lineups for a match.
-        Returns (home_player_ids, away_player_ids).
-        Empty lists if lineups not published.
-        """
-        lu = self.client.fetch(f"{API}/event/{match_id}/lineups")
-        if "error" in lu or not lu:
-            return [], []
+        pids = self.get_team_roster(team_id)
+        if not pids:
+            logger.warning("No squad data for team %d (%s)", team_id, team_name)
+            return []
 
-        def _ids(side: str) -> List[int]:
-            return [
-                p.get("player", {}).get("id")
-                for p in lu.get(side, {}).get("players", [])
-                if p.get("player", {}).get("id")
-            ]
+        logger.info("  %s: scanning full squad (%d players)...", team_name or f"Team {team_id}", len(pids))
+        injured = []
+        for pid in pids:
+            inj = self.client.get_injury(pid)
+            if inj and inj.get("status") in ("out", "sidelined"):
+                profile = self.client.player(pid)
+                injured.append({
+                    "player": profile.get("name", f"Player {pid}"),
+                    "player_id": pid,
+                    "injury": inj.get("reason", "Unknown"),
+                    "status": inj.get("status", "out"),
+                    "return_date": self._format_return(inj.get("endDateTimestamp")),
+                })
 
-        return _ids("home"), _ids("away")
+        if injured:
+            details = "; ".join(f"{i['player']} ({i['injury']})" for i in injured[:5])
+            if len(injured) > 5:
+                details += f" ... +{len(injured)-5} more"
+            logger.info("  🩹❌ %s — %d injured: %s", team_name or f"Team {team_id}", len(injured), details)
+        else:
+            logger.info("  ✅ %s — All fit (%d players)", team_name or f"Team {team_id}", len(pids))
 
-    # ── Injury scan ────────────────────────────────────────────────
+        return injured
 
     def scan_match_squads(self, match_id: int) -> Dict[str, List[dict]]:
-        """Scan both teams' match-day squads for injuries.
+        """Scan full squads for both teams in a match.
 
-        Returns:
-            {"home": [{"player": "...", "injury": "...", "status": "...", "return_date": "..."}],
-             "away": [...]}
+        Uses team IDs from the match event, not lineups.
+        Returns: {"home": [...], "away": [...]}
         """
         match_info = self.client.fetch(f"{API}/event/{match_id}")
         ev = match_info.get("event", {})
-        home_team = ev.get("homeTeam", {}).get("name", "Home")
-        away_team = ev.get("awayTeam", {}).get("name", "Away")
+        home_tid = ev.get("homeTeam", {}).get("id")
+        away_tid = ev.get("awayTeam", {}).get("id")
+        home_name = ev.get("homeTeam", {}).get("name", "Home")
+        away_name = ev.get("awayTeam", {}).get("name", "Away")
 
-        home_pids, away_pids = self.get_lineups(match_id)
-
-        logger.info("  %s: scanning %d players", home_team, len(home_pids))
-        home_inj = self._scan_players(home_pids)
-
-        logger.info("  %s: scanning %d players", away_team, len(away_pids))
-        away_inj = self._scan_players(away_pids)
-
-        result = {"home": home_inj, "away": away_inj}
-        self._log_result(home_team, home_inj)
-        self._log_result(away_team, away_inj)
+        result = {
+            "home": self.scan_team(home_tid, home_name) if home_tid else [],
+            "away": self.scan_team(away_tid, away_name) if away_tid else [],
+        }
         return result
 
     def scan_today(self) -> Dict[int, Dict[str, List[dict]]]:
         """Scan all today's EPL matches. Returns {match_id: {home: [...], away: [...]}}."""
+        self._load_squads()
         matches = self.today_matches()
-        logger.info("Scanning %d EPL matches for injuries...", len(matches))
+        logger.info("Scanning %d EPL matches for all squad injuries...", len(matches))
         results = {}
         for m in matches:
             mid = m["id"]

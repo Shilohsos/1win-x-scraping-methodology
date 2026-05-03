@@ -1,4 +1,4 @@
-# Methodology: Match-Day Injury Detection via Sofascore
+# Methodology: Full-Squad Injury Detection via Sofascore
 
 **Source:** [Sofascore API](https://www.sofascore.com/api-documentation) (Unofficial JSON API)
 **Tier:** Free (no API key required)
@@ -17,50 +17,83 @@
 | Data quality | Official partnerships | Aggregated |
 | Proxy required | Yes (SA residential) | No |
 | Player profiles | Rich (position, injury, stats) | Basic |
+| Squad coverage | Full squad (25-30 players) | Only match-day roster |
 
 ---
 
-## Approach: Match-Day Squad Only
+## Approach: Full Squad Scan
 
-We **only** check players in the match-day squad (starting XI + substitutes). Full-squad scans are expensive (~100+ API calls per team) and irrelevant — only the 20 players dressing for the match matter for edge calculation.
+We scan **every player registered to a team** in the EPL season, not just the match-day squad. This catches long-term absentees already ruled out before matchday — critical for edge calculation.
 
-### Data Flow
+### Why Full Squad Matters
+
+A match-day-only scan misses players who:
+- Were dropped from the squad at selection (already ruled out)
+- Are on long-term injury (out for months, not in training)
+- Returned to training but not yet match-fit
+
+These are exactly the players most relevant for edge detection.
+
+---
+
+## Data Flow
+
+### Step 1: Load full competition roster (1 API call, cached)
 
 ```
-Sofascore /unique-tournament/{id}/season/{id}/events/last/{page}
-  └─  Get today's EPL matches → match IDs, team names
-
-Sofascore /event/{match_id}/lineups
-  └─  Get starting XI + substitutes → player IDs
-
-Sofascore /player/{player_id}
-  └─  Check `injury` field → {reason, status, expectedReturn, endDateTimestamp}
+GET /unique-tournament/17/season/76986/players
+  ↓
+{team_id: [player_id, ...]}  ← 528 players across 20 EPL teams
 ```
 
-### Injury Response Shape
+Cached in memory for the session. Only re-fetched when the scanner is re-initialized.
+
+### Step 2: For each match, resolve team IDs from match event
+
+```
+GET /event/{match_id}
+  ↓
+{homeTeam: {id: 35, name: "Bournemouth"}, awayTeam: {id: 38, name: "Crystal Palace"}}
+```
+
+### Step 3: Scan each team's full roster
+
+For each player in the team's squad:
+```
+GET /player/{player_id}
+  ↓
+{player: {name: "...", injury: {...} or null}}
+```
+
+Each player profile is cached — no redundant fetches if the same player appears in multiple matches.
+
+---
+
+## Injury Data Format
+
+### Sofascore Response (player profile)
 
 ```json
 {
   "player": {
-    "name": "Chadi Riad",
+    "name": "Eddie Nketiah",
     "injury": {
-      "reason": "Knock Injury",
+      "reason": "Strain Injury",
       "status": "sidelined",
-      "expectedReturn": "2026-05-20",
-      "endDateTimestamp": 1777766400
+      "expectedReturn": "2026-06-20",
+      "endDateTimestamp": 1780358400
     }
   }
 }
 ```
 
-### Extracted Fields
+### Status Values
 
-| Field | Status | Meaning |
-|-------|--------|---------|
-| `reason` | String | Injury type (e.g., "Hamstring Injury", "Ankle Injury") |
-| `status` | `out` / `sidelined` / `dayToDay` | Severity classification |
-| `expectedReturn` | Date string | Estimated recovery date |
-| `endDateTimestamp` | Unix timestamp | Alternative return representation |
+| Status | Meaning | Included in Results |
+|--------|---------|-------------------|
+| `out` | Confirmed unavailable | ✅ Yes |
+| `sidelined` | Out indefinitely | ✅ Yes |
+| `dayToDay` | Questionable, could play | ❌ No (too speculative) |
 
 ---
 
@@ -72,21 +105,44 @@ Sofascore /player/{player_id}
 
 1. **Persistent browser** — Single `botasaurus_driver.Driver` instance reused across all API calls. Avoids ~2s Chrome launch overhead per call.
 
-2. **Player cache** — `SofascoreClient.player(pid)` caches profiles in memory per session. Same player appearing in multiple matches only fetched once.
+2. **Full squad roster** — `_load_squads()` fetches all 528 EPL players in one call, groups by team. Cached for the session.
 
-3. **Match-day only** — `get_lineups(match_id)` fetches only players in the squad. No full-squad scan.
+3. **Per-player cache** — `SofascoreClient.player(pid)` caches profiles in memory. Each player fetched at most once per session regardless of which team they play for.
 
-4. **Proxy** — SA residential proxy (`82.29.245.95:6919`) required. Direct requests to `api.sofascore.com` return 403 without proper TLS fingerprint.
+4. **Proxy** — SA residential proxy (`82.29.245.95:6919`) required. Direct requests to `api.sofascore.com` return 403.
 
 ### Performance
 
 | Action | Calls | Time | Notes |
 |--------|-------|------|-------|
-| Fetch today's matches | 6 | ~2s | 1 live + 5 scheduled pages |
-| Fetch lineups | 1 | ~2s | Per match |
-| Fetch player profiles | 40 | ~35s | 2 teams × 20 players, cached |
+| Load squad roster | 1 | ~2s | 528 players, cached per season |
+| Scan 1 team (25-30 players) | 25-30 | ~18-22s | First scan per team, cached |
+| Scan 1 match (2 teams) | 50-60 | ~40-45s | Both teams, cold cache |
+| Cached re-scan | 0 | ~0s | Player profiles cached |
 
-**Total per match:** ~40s (first scan) → ~5s (cached)
+**Total for 3-match day:** ~2-3 minutes cold (then instant for re-scans within session)
+
+---
+
+## Integration with Signal Engine
+
+```python
+collector = InjuriesCollector()
+result = await collector.get_for_match(match_id=14024023)
+# Returns:
+{
+    "home": [],
+    "away": [
+        {"player": "Chadi Riad", "injury": "Knock Injury",
+         "status": "sidelined", "return_date": "2026-05-20"},
+        {"player": "Jean Philippe Mateta", "injury": "Knee Injury",
+         "status": "sidelined", "return_date": "2026-03-13"},
+        # ... 2 more
+    ]
+}
+```
+
+Signal engine `_eval_availability()` reads `injuries["home"]` / `injuries["away"]` as lists and calculates impact score: `min(total * 0.1, 0.5)`.
 
 ---
 
@@ -94,48 +150,27 @@ Sofascore /player/{player_id}
 
 | Scenario | Behaviour |
 |----------|-----------|
-| No lineups published yet | Returns empty results gracefully |
-| Proxy down | Returns empty, logs error |
-| Player API returns 403 | Returns {} for that player, logs warning |
+| No squad data for team | Returns empty list, logs warning |
+| Player profile 403 | Returns `{}` for that player, continues |
+| Proxy connection lost | Browser reconnection fails, returns partial results |
 | No matches today | Returns empty dict |
-| Match already finished | Lineups still available (no problem) |
-
----
-
-## Integration with Signal Engine
-
-The collector returns:
-
-```python
-{
-    "home": [
-        {"player": "Chadi Riad", "injury": "Knock Injury",
-         "status": "sidelined", "return_date": "2026-05-20"},
-        ...
-    ],
-    "away": [...]
-}
-```
-
-The signal engine `_eval_availability()` reads:
-- `injuries["home"]` / `injuries["away"]` — list of injured players
-- Each item's `"player"` key for display
-- Count used for injury impact score: `min(total * 0.1, 0.5)`
+| Season ID changes | Squad roster returns empty; update `SEASON_ID` |
 
 ---
 
 ## Setup
 
 1. No API key required
-2. Ensure `botasaurus_driver` is installed (in `scraperfc_venv`)
-3. SA residential proxy configured in `injuries.py` (hardcoded for now)
-4. ScraperFC venv with Chrome `--no-sandbox` wrapper
+2. `botasaurus_driver` installed (in `scraperfc_venv`)
+3. SA residential proxy configured (hardcoded in `injuries.py`)
+4. Chrome `--no-sandbox` wrapper for root execution
 
 ---
 
 ## Limitations
 
-- **Slow on first run** (~35-40s per match for uncached player profiles)
-- **Browser dependency** — requires Chrome/botasaurus_driver, can't run with plain HTTP
-- **Match-day only** — doesn't detect injuries to players not in the squad (e.g., long-term absentees already ruled out)
-- **Sofascore API is unofficial** — may break if they change their endpoint structure
+- **Sofascore API is unofficial** — may break with endpoint changes
+- **Browser dependency** — requires Chrome/botasaurus, not pure HTTP
+- **Season ID must be updated** — changes each season
+- **Slow first scan** — ~40s per match for uncached profiles
+- **No injury history** — only shows current injury; no past/future predictions
