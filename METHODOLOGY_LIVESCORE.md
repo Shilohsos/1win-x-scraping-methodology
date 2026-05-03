@@ -203,6 +203,7 @@ for e in events:
 3. **Timezone** — kickoff times are **local to the match venue**, not UTC
 4. **Event IDs change daily** — same teams tomorrow = different `Eid`
 5. **Provider IDs (`Pids`)** — likely map to betting data sources; keep for future integration
+6. **Competition name variations** — LiveScore uses `"LaLiga"` (single word, no space). Multiple countries have identically-named competitions (e.g., "Premier League" exists in England, Bahrain, Canada, Jamaica). Always pair `Snm` (competition name) with `Cnm` (country name) for precise league identification.
 
 ---
 
