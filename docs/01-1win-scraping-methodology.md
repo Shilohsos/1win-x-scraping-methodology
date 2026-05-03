@@ -404,6 +404,9 @@ Before trusting scraped data:
 | Page under-rendered | humanize=False on heavy page | Always use humanize=True for aggregated (967 KB) pages |
 | Proxy IP shows local | CloakBrowser proxy param ignored | Set `os.environ['HTTP_PROXY']` and `HTTPS_PROXY` before launch |
 | Stale/missing odds | Bot detection triggered | Rotate user-agent via stealth_args; add random delays |
+| Section already expanded | Clicking an expanded header collapses it | Check for match pattern below header before clicking; skip if already expanded |
+| Different market shown first | Some leagues show "Total" before "Full time result" | Extend lookahead when scanning for 1/X/2 labels |
+| Playwright Sync inside asyncio | CloakBrowser sync API called from async context | Apply `nest_asyncio.apply()` before import, or use executor thread |
 
 ---
 
