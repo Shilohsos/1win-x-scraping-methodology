@@ -1,7 +1,7 @@
 # 1win.ng & X/Twitter Scraping Methodology
 
 **Author:** Wizard (Ferdinand Shiloh Hart)  
-**Last Updated:** 2026-05-02  
+**Last Updated:** 2026-05-03  
 **Repository:** Shilohsos/1win-x-scraping-methodology
 
 ---
@@ -24,13 +24,51 @@ Complete, battle-tested methodologies for extracting real-time sports odds, soci
 - **Scope:** Real-time tweet collection for sports events, trends analysis
 - **Performance:** ~2–3s query latency, 134+ tweets collected per test run
 
-### 3. LiveScore Fixture API (NEW)
-- **Tool:** Direct HTTP (curl / requests)
-- **Proxy:** ❌ None required
-- **Auth:** ❌ None required
-- **Method:** Public JSON API endpoint
-- **Scope:** 825+ fixtures/day across 263 competitions worldwide
-- **Coverage:** PL, LaLiga, Serie A, Bundesliga, Ligue 1, MLS, and 257+ more
+### 4. Sofascore EPL Injury Detection (NEW)
+- **Tool:** ScraperFC (botasaurus_driver) + Chrome headless
+- **Proxy:** SA residential (82.29.245.95:6919) — required
+- **Method:** Per-player profile fetch → `injury` field extraction
+- **Scope:** EPL match lineups + full squad injury reports
+- **Performance:** ~2–3 min for full matchday scan
+- **Key discovery:** Injury data lives on `/api/v1/player/{id}`, not a team endpoint
+- **Docs:** `docs/METHODOLOGY_SOFASCORE_INJURIES.md`
+- **Script:** `scripts/epl-scanner.py`
+
+---
+
+## Quick Start
+
+### 1win.ng Odds
+```bash
+cd scripts
+# Requires CloakBrowser + SA proxy
+python3 1win-odds-scraper.py
+```
+
+### LiveScore Fixtures
+```bash
+cd scripts
+python3 scrape_livescore.py
+```
+
+### X/Twitter Tweet Collection
+```bash
+cd scripts
+python3 x-tweet-collector.py --query "Premier League" --limit 50
+```
+
+### EPL Injury Scanner
+```bash
+# Requires ScraperFC venv + SA proxy + Chrome --no-sandbox
+/root/scraperfc_venv/bin/python scripts/epl-scanner.py
+```
+### 3. LiveScore Fixture API
+ - **Tool:** Direct HTTP (curl / requests)
+ - **Proxy:** ❌ None required
+ - **Auth:** ❌ None required
+ - **Method:** Public JSON API endpoint
+ - **Scope:** 825+ fixtures/day across 263 competitions worldwide
+ - **Coverage:** PL, LaLiga, Serie A, Bundesliga, Ligue 1, MLS, and 257+ more
 - **Status:** ✅ Production-ready — no blockers
 
 ### 1. 1win.ng Sports Odds Scraping
