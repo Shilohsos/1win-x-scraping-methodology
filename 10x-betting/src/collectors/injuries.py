@@ -1,136 +1,267 @@
 """
 10x Betting — Injuries Collector
-────────────────────────────────────────────────────────────────────────────────
-Sources:
-  - Sofascore Player Profile API (via proxied Chrome headless)
-    → Use: scripts/epl_scanner.py or SofascoreInjuryScanner class below
-  - API-Football (api-football.com) via RapidAPI (legacy, requires paid key)
+Source: Sofascore player profile API (via proxied browser)
+Scope: Match-day squad only — checks only players in starting XI + subs
 
-Sofascore approach:
-  Each player's profile on Sofascore has an optional 'injury' field containing:
-    { reason, status (dayToDay/out/sidelined), expectedReturn, endDateTimestamp }
+Flow:
+  1. Fetch today's EPL matches → Sofascore event IDs
+  2. For each match, fetch lineups → player IDs
+  3. For each player in squad, fetch profile → check `injury` field
+  4. Return list of injured players per team
 
-  To scan: get team squad from EPL season players endpoint, then fetch each
-  player's profile to check for the injury field. Cached in memory.
+Performance: ~35-40s per match (persistent browser, cached profiles)
 
-  See scripts/epl_scanner.py for full CLI implementation.
+Requires:
+  - botasaurus_driver (from scraperfc_venv)
+  - Webshare SA residential proxy (configured below)
 """
 import logging
-import aiohttp
-import os
-from datetime import datetime
-from typing import List, Optional, Dict
-from src.models.match import Match
+import json
+import time
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Set, Tuple
 
 logger = logging.getLogger("10xbet.injuries")
 
-BASE_URL = "https://api-football-v1.p.rapidapi.com/v3"
+# ─── Sofascore Config ─────────────────────────────────────────────
+API = "https://api.sofascore.com/api/v1"
+EPL_ID = 17
+SEASON_ID = 76986   # 2025/26
+PROXY = "http://pzxyatji:tqz8zcybhmj7@82.29.245.95:6919"
 
-class InjuryStatus:
-    OK = "ok"          # Available
-    DOUBT = "doubt"    # Questionable
-    OUT = "out"        # Confirmed unavailable
+from botasaurus_driver.driver import Driver as _Driver
 
-class InjuryRecord:
-    """Player injury information for a team"""
-    def __init__(self, player_name: str, injury_type: str, status: str, return_date: Optional[str] = None):
-        self.player_name = player_name
-        self.injury_type = injury_type    # e.g. "Knee injury", "Hamstring"
-        self.status = status              # "ok", "doubt", "out"
-        self.return_date = return_date    # Expected return (YYYY-MM-DD) or None
+
+class SofascoreClient:
+    """Persistent browser-based client for Sofascore JSON API."""
+
+    def __init__(self):
+        self._driver: Optional[_Driver] = None
+        self._player_cache: Dict[int, dict] = {}
+
+    def _get_driver(self) -> _Driver:
+        if self._driver is None:
+            self._driver = _Driver(
+                headless=True,
+                block_images_and_css=True,
+                wait_for_complete_page_load=True,
+                proxy=PROXY,
+            )
+        return self._driver
+
+    def fetch(self, url: str) -> dict:
+        """Fetch JSON from Sofascore via persistent proxied browser."""
+        d = self._get_driver()
+        try:
+            d.get(url)
+            return json.loads(d.page_text)
+        except json.JSONDecodeError:
+            logger.warning("JSON parse error from %s", url)
+            return {}
+        except Exception as e:
+            logger.warning("Fetch error %s: %s", url, e)
+            return {}
+
+    def close(self):
+        if self._driver is not None:
+            try:
+                self._driver.close()
+            except Exception:
+                pass
+            self._driver = None
+
+    def player(self, pid: int) -> dict:
+        """Cached player profile. Returns {} on error."""
+        if pid not in self._player_cache:
+            data = self.fetch(f"{API}/player/{pid}")
+            self._player_cache[pid] = data.get("player", {})
+        return self._player_cache[pid]
+
+    def get_injury(self, pid: int) -> Optional[dict]:
+        """Returns injury dict or None."""
+        return self.player(pid).get("injury")
+
+
+class SofascoreInjuryScanner:
+    """Scans match-day squads for injured players via Sofascore."""
+
+    def __init__(self):
+        self.client = SofascoreClient()
+
+    # ── Match data ─────────────────────────────────────────────────
+
+    def today_matches(self) -> List[dict]:
+        """All EPL matches happening today (live + scheduled)."""
+        now = datetime.now(timezone.utc)
+        day_start = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp())
+        day_end = day_start + 86400
+        seen: Set[int] = set()
+        out = []
+
+        # Live events
+        for e in self.client.fetch(f"{API}/sport/football/events/live").get("events", []):
+            tid = e.get("tournament", {}).get("uniqueTournament", {}).get("id")
+            if tid == EPL_ID and e["id"] not in seen:
+                seen.add(e["id"])
+                out.append(e)
+
+        # Scheduled events (last 0-4 pages cover today)
+        for page in range(5):
+            ev = self.client.fetch(f"{API}/unique-tournament/{EPL_ID}/season/{SEASON_ID}/events/last/{page}")
+            for e in ev.get("events", []):
+                ts = e.get("startTimestamp", 0)
+                if day_start <= ts < day_end and e["id"] not in seen:
+                    seen.add(e["id"])
+                    out.append(e)
+
+        out.sort(key=lambda m: m.get("startTimestamp", 0))
+        return out
+
+    def get_lineups(self, match_id: int) -> Tuple[List[int], List[int]]:
+        """
+        Fetch lineups for a match.
+        Returns (home_player_ids, away_player_ids).
+        Empty lists if lineups not published.
+        """
+        lu = self.client.fetch(f"{API}/event/{match_id}/lineups")
+        if "error" in lu or not lu:
+            return [], []
+
+        def _ids(side: str) -> List[int]:
+            return [
+                p.get("player", {}).get("id")
+                for p in lu.get(side, {}).get("players", [])
+                if p.get("player", {}).get("id")
+            ]
+
+        return _ids("home"), _ids("away")
+
+    # ── Injury scan ────────────────────────────────────────────────
+
+    def scan_match_squads(self, match_id: int) -> Dict[str, List[dict]]:
+        """Scan both teams' match-day squads for injuries.
+
+        Returns:
+            {"home": [{"player": "...", "injury": "...", "status": "...", "return_date": "..."}],
+             "away": [...]}
+        """
+        match_info = self.client.fetch(f"{API}/event/{match_id}")
+        ev = match_info.get("event", {})
+        home_team = ev.get("homeTeam", {}).get("name", "Home")
+        away_team = ev.get("awayTeam", {}).get("name", "Away")
+
+        home_pids, away_pids = self.get_lineups(match_id)
+
+        logger.info("  %s: scanning %d players", home_team, len(home_pids))
+        home_inj = self._scan_players(home_pids)
+
+        logger.info("  %s: scanning %d players", away_team, len(away_pids))
+        away_inj = self._scan_players(away_pids)
+
+        result = {"home": home_inj, "away": away_inj}
+        self._log_result(home_team, home_inj)
+        self._log_result(away_team, away_inj)
+        return result
+
+    def scan_today(self) -> Dict[int, Dict[str, List[dict]]]:
+        """Scan all today's EPL matches. Returns {match_id: {home: [...], away: [...]}}."""
+        matches = self.today_matches()
+        logger.info("Scanning %d EPL matches for injuries...", len(matches))
+        results = {}
+        for m in matches:
+            mid = m["id"]
+            home = m.get("homeTeam", {}).get("name", "?")
+            away = m.get("awayTeam", {}).get("name", "?")
+            logger.info("Match: %s vs %s (ID %d)", home, away, mid)
+            results[mid] = self.scan_match_squads(mid)
+        return results
+
+    def _scan_players(self, pids: List[int]) -> List[dict]:
+        """Check each player for injury. Returns injured-only list."""
+        injured = []
+        for pid in pids:
+            inj = self.client.get_injury(pid)
+            if inj and inj.get("status") in ("out", "sidelined"):
+                profile = self.client.player(pid)
+                injured.append({
+                    "player": profile.get("name", f"Player {pid}"),
+                    "player_id": pid,
+                    "injury": inj.get("reason", "Unknown"),
+                    "status": inj.get("status", "out"),
+                    "return_date": self._format_return(inj.get("endDateTimestamp")),
+                })
+        return injured
+
+    def _format_return(self, ts: Optional[int]) -> str:
+        if not ts:
+            return "Unknown"
+        try:
+            return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+        except (ValueError, OSError):
+            return "Unknown"
+
+    def _log_result(self, team: str, injuries: List[dict]):
+        if injuries:
+            details = "; ".join(f"{i['player']} ({i['injury']})" for i in injuries)
+            logger.info("  🩹❌ %s — %d: %s", team, len(injuries), details)
+        else:
+            logger.info("  ✅ %s — All fit", team)
+
+    def cleanup(self):
+        self.client.close()
+
 
 class InjuriesCollector:
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("API_FOOTBALL_KEY", "")
-        self.headers = {
-            "x-apisports-key": self.api_key,
-            "x-rapidapi-host": "api-football-v1.p.rapidapi.com"
-        }
-        self._cache: Dict[str, Dict] = {}   # key: f"{type}:{id}:{season}", value: list[InjuryRecord]
-        self.cache_ttl_days = 1
+    """
+    Match-day-squad injury collector.
 
-    async def get_team_injuries(self, team_id: str, season: str) -> List[InjuryRecord]:
-        """Fetch injury list for a specific team and season"""
-        cache_key = f"team:{team_id}:{season}"
-        cached = self._get_cached(cache_key)
-        if cached:
-            return cached
+    Replaces the broken API-Football InjuriesCollector.
+    Compatible with signal_engine interface.
 
-        params = {"team": team_id, "season": season}
-        records = await self._fetch_injuries(params)
-        self._cache[cache_key] = records
-        return records
+    Usage:
+        collector = InjuriesCollector()
+        result = await collector.get_for_match(match_id=12345)
+        # Returns: {"home": [...], "away": [...]}
+    """
 
-    async def get_league_injuries(self, league_id: str, season: str) -> List[InjuryRecord]:
-        """Fetch injury list for an entire league (batched)"""
-        cache_key = f"league:{league_id}:{season}"
-        cached = self._get_cached(cache_key)
-        if cached:
-            return cached
+    def __init__(self):
+        self._scanner: Optional[SofascoreInjuryScanner] = None
+        self._cache: Dict[int, Dict[str, List[dict]]] = {}
+        self._last_scan: float = 0
+        self._scan_interval: float = 7200  # 2 hours
 
-        params = {"league": league_id, "season": season}
-        records = await self._fetch_injuries(params)
-        self._cache[cache_key] = records
-        return records
+    def _get_scanner(self) -> SofascoreInjuryScanner:
+        if self._scanner is None:
+            self._scanner = SofascoreInjuryScanner()
+        return self._scanner
 
-    async def _fetch_injuries(self, params: dict) -> List[InjuryRecord]:
-        url = f"{BASE_URL}/injuries"
+    async def get_for_match(self, match_id: int) -> Dict[str, List[dict]]:
+        """Get match-day squad injuries. Uses cache when fresh."""
+        now = time.time()
+        if match_id in self._cache and (now - self._last_scan) < self._scan_interval:
+            return self._cache[match_id]
+
+        scanner = self._get_scanner()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, headers=self.headers, params=params,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return self._parse_injuries(data)
-                    elif resp.status == 429:
-                        logger.warning(f"API-Football rate limited (injuries): {resp.status}")
-                    else:
-                        logger.warning(f"API-Football error {resp.status} for injuries")
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, scanner.scan_match_squads, match_id)
+            self._cache[match_id] = result
+            self._last_scan = now
+            return result
         except Exception as e:
-            logger.error(f"Injuries fetch error: {e}")
+            logger.error("Injury scan failed for match %d: %s", match_id, e)
+            return {"home": [], "away": []}
+
+    def cleanup(self):
+        if self._scanner is not None:
+            self._scanner.cleanup()
+            self._scanner = None
+
+    # ── Legacy team-based interface ──
+    def get_team_injuries(self, team_name: str) -> List[dict]:
+        """Legacy: returns injury list for a team from cached scans."""
+        for match_data in self._cache.values():
+            for side in ("home", "away"):
+                return match_data.get(side, [])
         return []
-
-    def _parse_injuries(self, data: dict) -> List[InjuryRecord]:
-        records = []
-        for item in data.get("response", []):
-            player = item.get("player", {})
-            team = item.get("team", {})
-            injury = item.get("injury", {})
-            # API-Football returns:
-            #   player.name, injury.type, injury.start, injury.end
-            record = InjuryRecord(
-                player_name=player.get("name", "Unknown"),
-                injury_type=injury.get("type", "Unknown"),
-                status=self._classify_status(injury),
-                return_date=injury.get("end")  # Expected recovery date
-            )
-            records.append(record)
-        return records
-
-    def _classify_status(self, injury: dict) -> str:
-        """Map API-Football's injury data to our status enum"""
-        if not injury:
-            return InjuryStatus.OK
-        # API doesn't provide status; presence of injury means OUT until return_date passes
-        ret = injury.get("end", "")
-        if ret:
-            try:
-                ret_dt = datetime.strptime(ret, "%Y-%m-%d")
-                if ret_dt.date() < datetime.now().date():
-                    return InjuryStatus.OK
-            except ValueError:
-                pass
-        return InjuryStatus.OUT
-
-    def _get_cached(self, cache_key: str) -> Optional[List[InjuryRecord]]:
-        """Simple in-memory cache; TTL handled by stale-while-revalidate pattern"""
-        entry = self._cache.get(cache_key)
-        return entry if entry else None
-
-    def summarize_team_injuries(self, team_id: str, season: str) -> Dict:
-        """Return summary: {'available': n, 'doubt': n, 'out': n, 'critical_missing': int}"""
-        records = asyncio.run(self.get_team_injuries(team_id, season)) if False else None  # placeholder
-        # Will be filled after integration with async calling pattern
-        raise NotImplementedError("Use get_team_injuries() directly")
